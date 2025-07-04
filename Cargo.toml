@@ -1,0 +1,3 @@
+[workspace]
+members = ["enclave", "parent"]
+resolver = "2"

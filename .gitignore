@@ -1,0 +1,12 @@
+# Rust
+/target/
+Cargo.lock
+**/*.rs.bk
+*.pdb
+
+# VS Code
+.vscode/
+*.code-workspace
+
+# Nitro Enclave specific
+*.eif
