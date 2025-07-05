@@ -1,0 +1,8 @@
+[package]
+name = "crypto_utils"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0"
+sodiumoxide = "0.2"
