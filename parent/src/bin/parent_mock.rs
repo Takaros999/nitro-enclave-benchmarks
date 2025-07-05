@@ -19,18 +19,25 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
+use tokio::io::AsyncReadExt;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::signal;
 use tokio::time::{interval, MissedTickBehavior};
 use tokio_rustls::TlsAcceptor;
-use tokio_vsock::{VsockAddr, VsockStream};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    /// Enclave CID (usually 3)
-    #[arg(long, default_value = "3")]
+    /// Use mock enclave (TCP) instead of real enclave (VSocket)
+    #[arg(long)]
+    mock: bool,
+    
+    /// Mock enclave port (when using --mock)
+    #[arg(long, default_value = "3000")]
+    mock_port: u16,
+
+    /// Enclave CID (when using real enclave)
+    #[arg(long, default_value = "4")]
     cid: u32,
 
     /// Operating mode: subscribe or notify
@@ -45,7 +52,7 @@ struct Args {
     #[arg(long, default_value = "10")]
     seconds: u64,
 
-    /// Enclave vsock port
+    /// Enclave vsock port (when using real enclave)
     #[arg(long, default_value = "5005")]
     port: u32,
 
@@ -74,26 +81,19 @@ struct NotifyRequest {
     ciphertext: Vec<u8>,
 }
 
-/// Response message for notify mode (not used in current protocol)
-#[derive(Serialize, Deserialize, Debug)]
-struct NotifyResponse {
-    nonce: [u8; 12],
-    ciphertext: Vec<u8>,
-}
-
-/// Sends a single subscribe request and measures latency
-async fn send_subscribe_request(
-    addr: VsockAddr,
+/// Sends a single subscribe request to mock enclave and measures latency
+async fn send_mock_subscribe_request(
+    port: u16,
     _client_pk: &PublicKey,
     server_pk: &PublicKey,
     payload_size: usize,
 ) -> Result<Duration> {
     let start = Instant::now();
 
-    // Connect to enclave
-    let mut stream = VsockStream::connect(addr)
+    // Connect to mock enclave
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port))
         .await
-        .context("Failed to connect to enclave")?;
+        .context("Failed to connect to mock enclave")?;
 
     // Generate random payload
     let mut payload = vec![0u8; payload_size];
@@ -104,28 +104,14 @@ async fn send_subscribe_request(
 
     // Create and send request
     let request = SubscribeRequest { sealed_payload };
-    let request_bytes = bincode::serialize(&request).context("Failed to serialize request")?;
-    
-    // Send request length first
-    stream.write_all(&(request_bytes.len() as u64).to_le_bytes()).await.context("Failed to write request length")?;
-    
-    // Send request
-    stream.write_all(&request_bytes).await.context("Failed to write request")?;
+    bincode::serialize_into(&mut stream, &request).context("Failed to serialize request")?;
 
-    // Read response length
-    let mut len_bytes = [0u8; 8];
-    stream.read_exact(&mut len_bytes).await.context("Failed to read response length")?;
-    let response_len = u64::from_le_bytes(len_bytes) as usize;
-    
     // Read response
-    let mut response_bytes = vec![0u8; response_len];
-    stream.read_exact(&mut response_bytes).await.context("Failed to read response")?;
-    
-    // Deserialize response
-    let response: SubscribeResponse = bincode::deserialize(&response_bytes).context("Failed to deserialize response")?;
+    let response: SubscribeResponse =
+        bincode::deserialize_from(&mut stream).context("Failed to deserialize response")?;
 
     // Verify we can decrypt the response (for correctness)
-    let symmetric_key = chacha20poly1305::ChaCha20Poly1305::generate_key(&mut OsRng); // In real impl, this would be shared
+    let symmetric_key = chacha20poly1305::ChaCha20Poly1305::generate_key(&mut OsRng);
     let nonce = Nonce::from_slice(&response.nonce);
     match secretbox_decrypt(&symmetric_key, &nonce, &response.ciphertext) {
         Ok(_) => {} // Success, payload decrypted
@@ -138,18 +124,18 @@ async fn send_subscribe_request(
     Ok(start.elapsed())
 }
 
-/// Sends a single notify request and measures latency
-async fn send_notify_request(
-    addr: VsockAddr,
+/// Sends a single notify request to mock enclave and measures latency
+async fn send_mock_notify_request(
+    port: u16,
     symmetric_key: &Key,
     payload_size: usize,
 ) -> Result<Duration> {
     let start = Instant::now();
 
-    // Connect to enclave
-    let mut stream = VsockStream::connect(addr)
+    // Connect to mock enclave
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port))
         .await
-        .context("Failed to connect to enclave")?;
+        .context("Failed to connect to mock enclave")?;
 
     // Generate random braze_id as payload
     let mut payload = vec![0u8; payload_size];
@@ -163,13 +149,7 @@ async fn send_notify_request(
         nonce: nonce.clone().into(),
         ciphertext,
     };
-    let request_bytes = bincode::serialize(&request).context("Failed to serialize request")?;
-    
-    // Send request length first
-    stream.write_all(&(request_bytes.len() as u64).to_le_bytes()).await.context("Failed to write request length")?;
-    
-    // Send request
-    stream.write_all(&request_bytes).await.context("Failed to write request")?;
+    bincode::serialize_into(&mut stream, &request).context("Failed to serialize request")?;
 
     // Read response (1 byte: 0x01 for success, 0x00 for failure)
     let mut response_byte = [0u8; 1];
@@ -286,8 +266,6 @@ async fn start_mock_braze_server() -> Result<()> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // No initialization needed for pure Rust crypto
-
     let args = Args::parse();
 
     // Validate mode
@@ -298,16 +276,20 @@ async fn main() -> Result<()> {
         );
     }
 
-    // Set port based on mode (override CLI arg if needed)
-    let port = match args.mode.as_str() {
+    // Set port based on mode for VSocket (override CLI arg if needed)
+    let vsock_port = match args.mode.as_str() {
         "subscribe" => 5005,
         "notify" => 5006,
         _ => unreachable!(),
     };
 
-    println!("Starting parent process:");
+    println!("Starting parent process (mock mode: {}):", args.mock);
     println!("  Mode: {}", args.mode);
-    println!("  Target: vsock://{}:{}", args.cid, port);
+    if args.mock {
+        println!("  Target: TCP 127.0.0.1:{}", args.mock_port);
+    } else {
+        println!("  Target: vsock://{}:{}", args.cid, vsock_port);
+    }
     println!("  RPS: {}", args.rps);
     println!("  Duration: {} seconds", args.seconds);
     println!("  Mock Braze: {}", args.mock_braze);
@@ -357,7 +339,6 @@ async fn main() -> Result<()> {
     let mut ticker = interval(interval_duration);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
-    let addr = VsockAddr::new(args.cid, port);
     let test_duration = Duration::from_secs(args.seconds);
     let test_start = Instant::now();
 
@@ -377,16 +358,23 @@ async fn main() -> Result<()> {
             "subscribe" => {
                 let client_pk_clone = client_pk.clone();
                 let server_pk_clone = server_pk.clone();
+                let mock = args.mock;
+                let port = if mock { args.mock_port } else { vsock_port as u16 };
 
                 tokio::spawn(async move {
-                    match send_subscribe_request(addr, &client_pk_clone, &server_pk_clone, 1024)
-                        .await
-                    {
+                    let result = if mock {
+                        send_mock_subscribe_request(port, &client_pk_clone, &server_pk_clone, 1024).await
+                    } else {
+                        // TODO: Add VSocket implementation here
+                        Err(anyhow::anyhow!("VSocket not implemented in mock parent"))
+                    };
+
+                    match result {
                         Ok(latency) => {
-                            // Record latency in milliseconds
-                            let latency_ms = (latency.as_nanos() as f64 / 1_000_000.0) as u64;
+                            // Record latency in microseconds
+                            let latency_us = latency.as_micros() as u64;
                             if let Ok(mut hist) = histogram_clone.lock() {
-                                hist.record(latency_ms).ok();
+                                hist.record(latency_us).ok();
                             }
                         }
                         Err(e) => {
@@ -398,14 +386,23 @@ async fn main() -> Result<()> {
             "notify" => {
                 // Generate new symmetric key for each request
                 let symmetric_key = chacha20poly1305::ChaCha20Poly1305::generate_key(&mut OsRng);
+                let mock = args.mock;
+                let port = if mock { args.mock_port } else { vsock_port as u16 };
 
                 tokio::spawn(async move {
-                    match send_notify_request(addr, &symmetric_key, 32).await {
+                    let result = if mock {
+                        send_mock_notify_request(port, &symmetric_key, 32).await
+                    } else {
+                        // TODO: Add VSocket implementation here
+                        Err(anyhow::anyhow!("VSocket not implemented in mock parent"))
+                    };
+
+                    match result {
                         Ok(latency) => {
-                            // Record latency in milliseconds
-                            let latency_ms = (latency.as_nanos() as f64 / 1_000_000.0) as u64;
+                            // Record latency in microseconds
+                            let latency_us = latency.as_micros() as u64;
                             if let Ok(mut hist) = histogram_clone.lock() {
-                                hist.record(latency_ms).ok();
+                                hist.record(latency_us).ok();
                             }
                         }
                         Err(e) => {
@@ -430,14 +427,14 @@ async fn main() -> Result<()> {
 
     if let Ok(hist) = histogram.lock() {
         if hist.len() > 0 {
-            println!("\nLatency Statistics (milliseconds):");
-            println!("  Min:    {:.2}ms", hist.min() as f64);
-            println!("  p50:    {:.2}ms", hist.value_at_percentile(50.0));
-            println!("  p95:    {:.2}ms", hist.value_at_percentile(95.0));
-            println!("  p99:    {:.2}ms", hist.value_at_percentile(99.0));
-            println!("  Max:    {:.2}ms", hist.max() as f64);
-            println!("  Mean:   {:.2}ms", hist.mean());
-            println!("  StdDev: {:.2}ms", hist.stdev());
+            println!("\nLatency Statistics (microseconds):");
+            println!("  Min:    {}", hist.min());
+            println!("  p50:    {}", hist.value_at_percentile(50.0));
+            println!("  p95:    {}", hist.value_at_percentile(95.0));
+            println!("  p99:    {}", hist.value_at_percentile(99.0));
+            println!("  Max:    {}", hist.max());
+            println!("  Mean:   {:.2}", hist.mean());
+            println!("  StdDev: {:.2}", hist.stdev());
         } else {
             println!("\nNo successful requests completed");
         }

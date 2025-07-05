@@ -1,13 +1,13 @@
 #![deny(clippy::all)]
-#![allow(unsafe_code)] // Required for sodiumoxide
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use sodiumoxide::crypto::box_::{PublicKey, SecretKey};
-use sodiumoxide::crypto::sealedbox;
-use sodiumoxide::crypto::secretbox::{self, Key, Nonce};
+use crypto_box::{PublicKey, SecretKey};
+use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
+use chacha20poly1305::aead::{Aead, KeyInit, OsRng};
 use std::fs;
 use std::path::Path;
+use rand::RngCore;
 
 /// Static keys structure to be serialized to JSON
 #[derive(Serialize, Deserialize, Debug)]
@@ -48,55 +48,56 @@ pub fn load_static_keys() -> Result<(PublicKey, SecretKey, Key)> {
         .decode(&keys.symmetric_key)
         .context("Failed to decode symmetric key from base64")?;
 
-    // Convert to sodiumoxide types
-    let pk = PublicKey::from_slice(&pk_bytes)
-        .ok_or_else(|| anyhow::anyhow!("Invalid public key length"))?;
-    let sk = SecretKey::from_slice(&sk_bytes)
-        .ok_or_else(|| anyhow::anyhow!("Invalid secret key length"))?;
-    let sym_key = Key::from_slice(&sym_bytes)
-        .ok_or_else(|| anyhow::anyhow!("Invalid symmetric key length"))?;
+    // Convert to crypto_box types
+    let pk = PublicKey::from_bytes(pk_bytes.as_slice().try_into()
+        .map_err(|_| anyhow::anyhow!("Invalid public key length"))?);
+    let sk = SecretKey::from_bytes(sk_bytes.as_slice().try_into()
+        .map_err(|_| anyhow::anyhow!("Invalid secret key length"))?);
+    let sym_key = *Key::from_slice(&sym_bytes);
 
     Ok((pk, sk, sym_key))
 }
 
-/// Encrypts a message to a public key using libsodium sealed boxes.
-/// This provides anonymous sender encryption (X25519 + XChaCha20-Poly1305).
+/// Encrypts a message to a public key using crypto_box sealed boxes.
+/// This provides anonymous sender encryption (X25519 + XSalsa20-Poly1305).
 pub fn seal_to_pk(pk: &PublicKey, msg: &[u8]) -> Vec<u8> {
-    sealedbox::seal(msg, pk)
+    let mut rng = OsRng;
+    pk.seal(&mut rng, msg).expect("Sealing failed")
 }
 
 /// Decrypts a sealed box using the corresponding secret key.
 /// Fails closed: returns error if decryption fails, never partial plaintext.
 pub fn open_with_sk(sk: &SecretKey, ct: &[u8]) -> Result<Vec<u8>> {
-    let pk = sk.public_key();
-    sealedbox::open(ct, &pk, sk).map_err(|_| anyhow::anyhow!("Failed to decrypt sealed box"))
+    sk.unseal(ct).map_err(|_| anyhow::anyhow!("Failed to decrypt sealed box"))
 }
 
 /// Encrypts a message using symmetric encryption with a fresh random nonce.
 /// Returns the nonce and ciphertext for transmission together.
 pub fn secretbox_encrypt(key: &Key, msg: &[u8]) -> (Nonce, Vec<u8>) {
-    let nonce = secretbox::gen_nonce();
-    let ciphertext = secretbox::seal(msg, &nonce, key);
-    (nonce, ciphertext)
+    let cipher = ChaCha20Poly1305::new(key);
+    let mut nonce_bytes = [0u8; 12];
+    OsRng.fill_bytes(&mut nonce_bytes);
+    let nonce = Nonce::from_slice(&nonce_bytes);
+    let ciphertext = cipher.encrypt(nonce, msg).expect("Encryption failed");
+    (*nonce, ciphertext)
 }
 
 /// Decrypts a secretbox ciphertext using the provided key and nonce.
 /// Fails closed: returns error if decryption fails, never partial plaintext.
 pub fn secretbox_decrypt(key: &Key, nonce: &Nonce, ct: &[u8]) -> Result<Vec<u8>> {
-    secretbox::open(ct, nonce, key).map_err(|_| anyhow::anyhow!("Failed to decrypt secretbox"))
+    let cipher = ChaCha20Poly1305::new(key);
+    cipher.decrypt(nonce, ct).map_err(|_| anyhow::anyhow!("Failed to decrypt secretbox"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sodiumoxide::crypto::box_;
+    use crypto_box::{PublicKey, SecretKey};
 
     #[test]
     fn test_seal_and_open_roundtrip() {
-        // Initialize libsodium
-        sodiumoxide::init().unwrap();
-
-        let (pk, sk) = box_::gen_keypair();
+        let sk = SecretKey::generate(&mut OsRng);
+        let pk = sk.public_key();
         let msg = b"Hello, Nitro Enclave!";
 
         let ct = seal_to_pk(&pk, msg);
@@ -107,10 +108,9 @@ mod tests {
 
     #[test]
     fn test_open_with_wrong_key_fails() {
-        sodiumoxide::init().unwrap();
-
-        let (pk, _sk) = box_::gen_keypair();
-        let (_pk2, sk2) = box_::gen_keypair();
+        let sk = SecretKey::generate(&mut OsRng);
+        let pk = sk.public_key();
+        let sk2 = SecretKey::generate(&mut OsRng);
         let msg = b"Secret message";
 
         let ct = seal_to_pk(&pk, msg);
@@ -121,8 +121,6 @@ mod tests {
 
     #[test]
     fn test_libsodium_test_vectors() {
-        sodiumoxide::init().unwrap();
-
         // Test vector from libsodium tests
         // These are small, hardcoded vectors for sealed box operations
         let sk_bytes = [
@@ -137,12 +135,12 @@ mod tests {
             0x6f, 0x88, 0x2b, 0x4f,
         ];
 
-        let sk = SecretKey::from_slice(&sk_bytes).unwrap();
-        let pk = PublicKey::from_slice(&pk_bytes).unwrap();
+        let sk = SecretKey::from_bytes(sk_bytes);
+        let pk = PublicKey::from_bytes(pk_bytes);
 
         // Verify the public key derivation matches
         let derived_pk = sk.public_key();
-        assert_eq!(pk.0, derived_pk.0);
+        assert_eq!(pk.as_bytes(), derived_pk.as_bytes());
 
         // Test encryption and decryption
         let msg = b"test message";
@@ -154,9 +152,8 @@ mod tests {
 
     #[test]
     fn test_empty_message() {
-        sodiumoxide::init().unwrap();
-
-        let (pk, sk) = box_::gen_keypair();
+        let sk = SecretKey::generate(&mut OsRng);
+        let pk = sk.public_key();
         let msg = b"";
 
         let ct = seal_to_pk(&pk, msg);
@@ -167,9 +164,8 @@ mod tests {
 
     #[test]
     fn test_corrupted_ciphertext_fails() {
-        sodiumoxide::init().unwrap();
-
-        let (pk, sk) = box_::gen_keypair();
+        let sk = SecretKey::generate(&mut OsRng);
+        let pk = sk.public_key();
         let msg = b"test";
 
         let mut ct = seal_to_pk(&pk, msg);
@@ -182,9 +178,7 @@ mod tests {
 
     #[test]
     fn test_secretbox_roundtrip() {
-        sodiumoxide::init().unwrap();
-
-        let key = secretbox::gen_key();
+        let key = ChaCha20Poly1305::generate_key(&mut OsRng);
         let msg = b"Secret symmetric message";
 
         let (nonce, ct) = secretbox_encrypt(&key, msg);
@@ -195,10 +189,8 @@ mod tests {
 
     #[test]
     fn test_secretbox_wrong_key_fails() {
-        sodiumoxide::init().unwrap();
-
-        let key1 = secretbox::gen_key();
-        let key2 = secretbox::gen_key();
+        let key1 = ChaCha20Poly1305::generate_key(&mut OsRng);
+        let key2 = ChaCha20Poly1305::generate_key(&mut OsRng);
         let msg = b"Secret";
 
         let (nonce, ct) = secretbox_encrypt(&key1, msg);
@@ -209,14 +201,14 @@ mod tests {
 
     #[test]
     fn test_secretbox_wrong_nonce_fails() {
-        sodiumoxide::init().unwrap();
-
-        let key = secretbox::gen_key();
+        let key = ChaCha20Poly1305::generate_key(&mut OsRng);
         let msg = b"Secret";
 
         let (_, ct) = secretbox_encrypt(&key, msg);
-        let wrong_nonce = secretbox::gen_nonce();
-        let result = secretbox_decrypt(&key, &wrong_nonce, &ct);
+        let mut wrong_nonce_bytes = [0u8; 12];
+        OsRng.fill_bytes(&mut wrong_nonce_bytes);
+        let wrong_nonce = Nonce::from_slice(&wrong_nonce_bytes);
+        let result = secretbox_decrypt(&key, wrong_nonce, &ct);
 
         assert!(result.is_err());
     }
@@ -226,16 +218,15 @@ mod tests {
 mod proptests {
     use super::*;
     use proptest::prelude::*;
-    use sodiumoxide::crypto::box_;
+    use crypto_box::{PublicKey, SecretKey};
 
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(256))]
 
         #[test]
         fn prop_sealedbox_roundtrip(payload in prop::collection::vec(any::<u8>(), 1..=4096)) {
-            sodiumoxide::init().unwrap();
-
-            let (pk, sk) = box_::gen_keypair();
+            let sk = SecretKey::generate(&mut OsRng);
+            let pk = sk.public_key();
             let ct = seal_to_pk(&pk, &payload);
             let pt = open_with_sk(&sk, &ct).unwrap();
 
@@ -244,9 +235,7 @@ mod proptests {
 
         #[test]
         fn prop_secretbox_roundtrip(payload in prop::collection::vec(any::<u8>(), 1..=4096)) {
-            sodiumoxide::init().unwrap();
-
-            let key = secretbox::gen_key();
+            let key = ChaCha20Poly1305::generate_key(&mut OsRng);
             let (nonce, ct) = secretbox_encrypt(&key, &payload);
             let pt = secretbox_decrypt(&key, &nonce, &ct).unwrap();
 

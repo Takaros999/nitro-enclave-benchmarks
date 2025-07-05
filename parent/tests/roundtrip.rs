@@ -3,8 +3,9 @@
 use anyhow::{Context, Result};
 use crypto_utils::{open_with_sk, seal_to_pk, secretbox_decrypt, secretbox_encrypt};
 use serde::{Deserialize, Serialize};
-use sodiumoxide::crypto::box_::{gen_keypair, PublicKey, SecretKey};
-use sodiumoxide::crypto::secretbox::{self, Key, Nonce};
+use crypto_box::{PublicKey, SecretKey};
+use chacha20poly1305::{Key, Nonce};
+use chacha20poly1305::aead::{KeyInit, OsRng};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -19,14 +20,14 @@ struct SubscribeRequest {
 /// Response message matching the enclave protocol
 #[derive(Serialize, Deserialize, Debug)]
 struct SubscribeResponse {
-    nonce: [u8; 24],
+    nonce: [u8; 12],
     ciphertext: Vec<u8>,
 }
 
 /// Request message for notify mode
 #[derive(Serialize, Deserialize, Debug)]
 struct NotifyRequest {
-    nonce: [u8; 24],
+    nonce: [u8; 12],
     ciphertext: Vec<u8>,
 }
 
@@ -64,7 +65,7 @@ async fn mock_enclave_handler(
 
     // Send response
     let response = SubscribeResponse {
-        nonce: nonce.0,
+        nonce: nonce.clone().into(),
         ciphertext,
     };
 
@@ -87,13 +88,14 @@ async fn mock_enclave_handler(
 }
 
 /// Starts a mock enclave server
-async fn start_mock_enclave(port: u16) -> Result<(PublicKey, Arc<secretbox::Key>)> {
+async fn start_mock_enclave(port: u16) -> Result<(PublicKey, Arc<Key>)> {
     // Generate server keypair
-    let (server_pk, server_sk) = gen_keypair();
+    let server_sk = SecretKey::generate(&mut OsRng);
+    let server_pk = server_sk.public_key();
     let server_sk = Arc::new(server_sk);
 
     // Generate symmetric key
-    let symmetric_key = Arc::new(secretbox::gen_key());
+    let symmetric_key = Arc::new(chacha20poly1305::ChaCha20Poly1305::generate_key(&mut OsRng));
     let symmetric_key_clone = symmetric_key.clone();
 
     // Start TCP listener
@@ -177,8 +179,7 @@ async fn send_test_request(port: u16, server_pk: &PublicKey, payload: &[u8]) -> 
 
 #[tokio::test]
 async fn test_roundtrip_communication() -> Result<()> {
-    // Initialize sodiumoxide
-    sodiumoxide::init().map_err(|_| anyhow::anyhow!("Failed to initialize sodiumoxide"))?;
+    // No initialization needed for pure Rust crypto
 
     // Use a random port to avoid conflicts
     let port = 15005;
@@ -215,7 +216,7 @@ async fn test_roundtrip_communication() -> Result<()> {
 
 #[tokio::test]
 async fn test_multiple_sequential_requests() -> Result<()> {
-    sodiumoxide::init().map_err(|_| anyhow::anyhow!("Failed to initialize sodiumoxide"))?;
+    // No initialization needed for pure Rust crypto
 
     let port = 15006;
     let (server_pk, _symmetric_key) = start_mock_enclave(port).await?;
@@ -241,7 +242,7 @@ async fn test_multiple_sequential_requests() -> Result<()> {
 
 #[tokio::test]
 async fn test_concurrent_requests() -> Result<()> {
-    sodiumoxide::init().map_err(|_| anyhow::anyhow!("Failed to initialize sodiumoxide"))?;
+    // No initialization needed for pure Rust crypto
 
     let port = 15007;
     let (server_pk, _symmetric_key) = start_mock_enclave(port).await?;
@@ -280,7 +281,7 @@ async fn test_concurrent_requests() -> Result<()> {
 
 #[tokio::test]
 async fn test_large_payload() -> Result<()> {
-    sodiumoxide::init().map_err(|_| anyhow::anyhow!("Failed to initialize sodiumoxide"))?;
+    // No initialization needed for pure Rust crypto
 
     let port = 15008;
     let (server_pk, _symmetric_key) = start_mock_enclave(port).await?;
@@ -328,7 +329,7 @@ async fn mock_notify_enclave_handler(mut stream: TcpStream, symmetric_key: Arc<K
         .context("Failed to deserialize notify request in mock enclave")?;
 
     // Extract nonce and decrypt
-    let nonce = Nonce::from_slice(&request.nonce).context("Invalid nonce")?;
+    let nonce = Nonce::from_slice(&request.nonce);
     let _braze_id = secretbox_decrypt(&symmetric_key, &nonce, &request.ciphertext)
         .context("Failed to decrypt braze_id in mock enclave")?;
 
@@ -344,7 +345,7 @@ async fn mock_notify_enclave_handler(mut stream: TcpStream, symmetric_key: Arc<K
 /// Starts a mock notify enclave server
 async fn start_mock_notify_enclave(port: u16) -> Result<Arc<Key>> {
     // Generate symmetric key
-    let symmetric_key = Arc::new(secretbox::gen_key());
+    let symmetric_key = Arc::new(chacha20poly1305::ChaCha20Poly1305::generate_key(&mut OsRng));
     let symmetric_key_clone = symmetric_key.clone();
 
     // Start TCP listener
@@ -388,7 +389,7 @@ async fn send_test_notify_request(port: u16, symmetric_key: &Key, payload: &[u8]
 
     // Send request
     let request = NotifyRequest {
-        nonce: nonce.0,
+        nonce: nonce.clone().into(),
         ciphertext,
     };
     let request_bytes = bincode::serialize(&request).context("Failed to serialize request")?;
@@ -424,8 +425,7 @@ async fn send_test_notify_request(port: u16, symmetric_key: &Key, payload: &[u8]
 
 #[tokio::test]
 async fn test_notify_roundtrip() -> Result<()> {
-    // Initialize sodiumoxide
-    sodiumoxide::init().map_err(|_| anyhow::anyhow!("Failed to initialize sodiumoxide"))?;
+    // No initialization needed for pure Rust crypto
 
     // Use a random port to avoid conflicts
     let port = 15010;

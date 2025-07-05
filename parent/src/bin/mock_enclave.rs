@@ -8,12 +8,11 @@ use hyper_rustls::HttpsConnectorBuilder;
 use rustls::{Certificate, ClientConfig, RootCertStore};
 use rustls_pemfile;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 use crypto_box::SecretKey;
 use chacha20poly1305::{Key, Nonce};
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio_vsock::{VsockAddr, VsockListener, VsockStream};
+use tokio::io::AsyncWriteExt;
+use tokio::net::{TcpListener, TcpStream};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -21,9 +20,13 @@ struct Args {
     /// Operating mode: subscribe or notify
     #[arg(long, default_value = "subscribe")]
     mode: String,
+    
+    /// Port to listen on
+    #[arg(long, default_value = "3000")]
+    port: u16,
 }
 
-/// Operating mode for the enclave
+/// Operating mode for the mock enclave
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Mode {
     Subscribe,
@@ -65,36 +68,25 @@ struct NotifyRequest {
     ciphertext: Vec<u8>,
 }
 
-/// Response message for notify mode
-#[derive(Serialize, Deserialize, Debug)]
-struct NotifyResponse {
-    nonce: [u8; 12],
-    ciphertext: Vec<u8>,
-}
-
-/// Handles a single vsock connection for subscribe mode.
-/// Protocol: uses bincode serialization for request/response messages
+/// Handles a single TCP connection for subscribe mode.
 async fn handle_subscribe_connection(
-    mut stream: VsockStream,
+    mut stream: TcpStream,
     server_sk: Arc<SecretKey>,
     symmetric_key: Arc<Key>,
 ) -> Result<()> {
-    // Read message length first (8 bytes)
-    let mut len_bytes = [0u8; 8];
-    stream.read_exact(&mut len_bytes).await.context("Failed to read message length")?;
-    let msg_len = u64::from_le_bytes(len_bytes) as usize;
+    println!("Handling subscribe connection");
     
-    // Read the message
-    let mut msg_bytes = vec![0u8; msg_len];
-    stream.read_exact(&mut msg_bytes).await.context("Failed to read message")?;
-    
-    // Deserialize request
-    let request: SubscribeRequest = bincode::deserialize(&msg_bytes)
+    // Read request using bincode - it handles length-prefixing automatically
+    let request: SubscribeRequest = bincode::deserialize_from(&mut stream)
         .context("Failed to deserialize subscribe request")?;
+    
+    println!("Received subscribe request with payload size: {}", request.sealed_payload.len());
 
     // Decrypt sealed box with server secret key
     let plaintext = open_with_sk(&server_sk, &request.sealed_payload)
         .context("Failed to decrypt sealed box")?;
+    
+    println!("Decrypted payload size: {}", plaintext.len());
 
     // Re-encrypt with symmetric key
     let (nonce, ciphertext) = secretbox_encrypt(&symmetric_key, &plaintext);
@@ -104,39 +96,31 @@ async fn handle_subscribe_connection(
         nonce: nonce.clone().into(),
         ciphertext,
     };
-
-    // Serialize response
-    let response_bytes = bincode::serialize(&response).context("Failed to serialize response")?;
     
-    // Send response length first
-    stream.write_all(&(response_bytes.len() as u64).to_le_bytes()).await.context("Failed to write response length")?;
-    
-    // Send response
-    stream.write_all(&response_bytes).await.context("Failed to write response")?;
+    println!("Sending response with nonce: {:?}", &response.nonce[..4]);
 
+    // Write response using bincode - it handles length-prefixing automatically
+    bincode::serialize_into(&mut stream, &response)
+        .context("Failed to serialize subscribe response")?;
+    
+    println!("Subscribe response sent successfully");
     Ok(())
 }
 
-/// Handles a single vsock connection for notify mode.
-/// Protocol: uses bincode serialization for request message
+/// Handles a single TCP connection for notify mode.
 async fn handle_notify_connection(
-    mut stream: VsockStream,
+    mut stream: TcpStream,
     _server_sk: Arc<SecretKey>,
     symmetric_key: Arc<Key>,
     https_client: Arc<Client<hyper_rustls::HttpsConnector<hyper::client::HttpConnector>>>,
 ) -> Result<()> {
-    // Read message length first (8 bytes)
-    let mut len_bytes = [0u8; 8];
-    stream.read_exact(&mut len_bytes).await.context("Failed to read message length")?;
-    let msg_len = u64::from_le_bytes(len_bytes) as usize;
+    println!("Handling notify connection");
     
-    // Read the message
-    let mut msg_bytes = vec![0u8; msg_len];
-    stream.read_exact(&mut msg_bytes).await.context("Failed to read message")?;
+    // Read request using bincode
+    let request: NotifyRequest =
+        bincode::deserialize_from(&mut stream).context("Failed to deserialize notify request")?;
     
-    // Deserialize request
-    let request: NotifyRequest = bincode::deserialize(&msg_bytes)
-        .context("Failed to deserialize notify request")?;
+    println!("Received notify request with nonce: {:?}", &request.nonce[..4]);
 
     // Extract nonce and ciphertext
     let nonce = Nonce::from_slice(&request.nonce);
@@ -146,9 +130,11 @@ async fn handle_notify_connection(
     let braze_id_bytes = secretbox_decrypt(&symmetric_key, &nonce, &ciphertext)
         .context("Failed to decrypt braze_id")?;
     let braze_id = String::from_utf8(braze_id_bytes).context("Invalid UTF-8 in braze_id")?;
+    
+    println!("Decrypted braze_id: {}", braze_id);
 
     // Build JSON body
-    let json_body = json!({
+    let json_body = serde_json::json!({
         "braze_id": braze_id
     });
 
@@ -168,6 +154,7 @@ async fn handle_notify_connection(
 
     // Check response status
     let success = res.status().is_success();
+    println!("HTTPS request result: {}", if success { "success" } else { "failure" });
 
     // Send response back to client (1 byte: 0x01 for success, 0x00 for failure)
     let response_byte = if success { 0x01u8 } else { 0x00u8 };
@@ -175,14 +162,13 @@ async fn handle_notify_connection(
         .write_all(&[response_byte])
         .await
         .context("Failed to write response")?;
-
+    
+    println!("Notify response sent successfully");
     Ok(())
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // No initialization needed for pure Rust crypto
-
     let args = Args::parse();
 
     // Parse mode
@@ -221,23 +207,17 @@ async fn main() -> Result<()> {
         .build();
     let https_client = Arc::new(Client::builder().build::<_, hyper::Body>(https_connector));
 
-    // Determine port based on mode
-    let port = match mode {
-        Mode::Subscribe => 5005,
-        Mode::Notify => 5006,
-    };
+    // Listen on TCP port
+    let addr = format!("127.0.0.1:{}", args.port);
+    let listener = TcpListener::bind(&addr).await.context("Failed to bind TCP listener")?;
 
-    // Listen on vsock CID 4 with mode-specific port
-    let addr = VsockAddr::new(4, port);
-    let mut listener = VsockListener::bind(addr).context("Failed to bind vsock listener")?;
-
-    println!("Listening on vsock://4:{} in {:?} mode", port, mode);
+    println!("Mock enclave listening on {} in {:?} mode", addr, mode);
 
     loop {
         let (stream, addr) = listener
             .accept()
             .await
-            .context("Failed to accept vsock connection")?;
+            .context("Failed to accept TCP connection")?;
 
         println!("Accepted connection from {:?}", addr);
 

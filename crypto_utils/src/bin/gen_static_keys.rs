@@ -1,29 +1,28 @@
 #![deny(clippy::all)]
-#![allow(unsafe_code)] // Required for sodiumoxide::init()
 
 use anyhow::{Context, Result};
 use crypto_utils::StaticKeys;
-use sodiumoxide::crypto::box_::gen_keypair;
+use crypto_box::SecretKey;
+use chacha20poly1305::{ChaCha20Poly1305, KeyInit};
+use chacha20poly1305::aead::OsRng;
 use std::fs;
 use std::path::Path;
 
 fn main() -> Result<()> {
-    // Initialize sodiumoxide
-    sodiumoxide::init().map_err(|_| anyhow::anyhow!("Failed to initialize sodiumoxide"))?;
-
     // Generate keypair for sealed box operations
-    let (pk, sk) = gen_keypair();
+    let sk = SecretKey::generate(&mut OsRng);
+    let pk = sk.public_key();
 
     // Generate symmetric key for secret box operations
-    let symmetric_key = sodiumoxide::crypto::secretbox::gen_key();
+    let symmetric_key = ChaCha20Poly1305::generate_key(&mut OsRng);
 
     // Create the keys structure
     use base64::Engine;
     let engine = base64::engine::general_purpose::STANDARD;
     let keys = StaticKeys {
-        public_key: engine.encode(&pk.0),
-        secret_key: engine.encode(&sk.0),
-        symmetric_key: engine.encode(&symmetric_key.0),
+        public_key: engine.encode(pk.as_bytes()),
+        secret_key: engine.encode(sk.to_bytes()),
+        symmetric_key: engine.encode(&symmetric_key),
     };
 
     // Serialize to pretty JSON
@@ -41,11 +40,11 @@ fn main() -> Result<()> {
         keys_path.display()
     );
     println!("\nGenerated keys:");
-    println!("  Public key ({}): {}", pk.0.len(), keys.public_key);
-    println!("  Secret key ({}): {}", sk.0.len(), keys.secret_key);
+    println!("  Public key ({}): {}", pk.as_bytes().len(), keys.public_key);
+    println!("  Secret key ({}): {}", sk.to_bytes().len(), keys.secret_key);
     println!(
         "  Symmetric key ({}): {}",
-        symmetric_key.0.len(),
+        symmetric_key.len(),
         keys.symmetric_key
     );
 
