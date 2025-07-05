@@ -3,6 +3,7 @@
 use anyhow::Result;
 use sodiumoxide::crypto::box_::{PublicKey, SecretKey};
 use sodiumoxide::crypto::sealedbox;
+use sodiumoxide::crypto::secretbox::{self, Key, Nonce};
 
 /// Encrypts a message to a public key using libsodium sealed boxes.
 /// This provides anonymous sender encryption (X25519 + XChaCha20-Poly1305).
@@ -16,6 +17,21 @@ pub fn open_with_sk(sk: &SecretKey, ct: &[u8]) -> Result<Vec<u8>> {
     let pk = sk.public_key();
     sealedbox::open(ct, &pk, sk)
         .map_err(|_| anyhow::anyhow!("Failed to decrypt sealed box"))
+}
+
+/// Encrypts a message using symmetric encryption with a fresh random nonce.
+/// Returns the nonce and ciphertext for transmission together.
+pub fn secretbox_encrypt(key: &Key, msg: &[u8]) -> (Nonce, Vec<u8>) {
+    let nonce = secretbox::gen_nonce();
+    let ciphertext = secretbox::seal(msg, &nonce, key);
+    (nonce, ciphertext)
+}
+
+/// Decrypts a secretbox ciphertext using the provided key and nonce.
+/// Fails closed: returns error if decryption fails, never partial plaintext.
+pub fn secretbox_decrypt(key: &Key, nonce: &Nonce, ct: &[u8]) -> Result<Vec<u8>> {
+    secretbox::open(ct, nonce, key)
+        .map_err(|_| anyhow::anyhow!("Failed to decrypt secretbox"))
 }
 
 #[cfg(test)]
@@ -112,5 +128,79 @@ mod tests {
         
         let result = open_with_sk(&sk, &ct);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_secretbox_roundtrip() {
+        sodiumoxide::init().unwrap();
+        
+        let key = secretbox::gen_key();
+        let msg = b"Secret symmetric message";
+        
+        let (nonce, ct) = secretbox_encrypt(&key, msg);
+        let pt = secretbox_decrypt(&key, &nonce, &ct).unwrap();
+        
+        assert_eq!(msg, &pt[..]);
+    }
+
+    #[test]
+    fn test_secretbox_wrong_key_fails() {
+        sodiumoxide::init().unwrap();
+        
+        let key1 = secretbox::gen_key();
+        let key2 = secretbox::gen_key();
+        let msg = b"Secret";
+        
+        let (nonce, ct) = secretbox_encrypt(&key1, msg);
+        let result = secretbox_decrypt(&key2, &nonce, &ct);
+        
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_secretbox_wrong_nonce_fails() {
+        sodiumoxide::init().unwrap();
+        
+        let key = secretbox::gen_key();
+        let msg = b"Secret";
+        
+        let (_, ct) = secretbox_encrypt(&key, msg);
+        let wrong_nonce = secretbox::gen_nonce();
+        let result = secretbox_decrypt(&key, &wrong_nonce, &ct);
+        
+        assert!(result.is_err());
+    }
+}
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+    use sodiumoxide::crypto::box_;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+        
+        #[test]
+        fn prop_sealedbox_roundtrip(payload in prop::collection::vec(any::<u8>(), 1..=4096)) {
+            sodiumoxide::init().unwrap();
+            
+            let (pk, sk) = box_::gen_keypair();
+            let ct = seal_to_pk(&pk, &payload);
+            let pt = open_with_sk(&sk, &ct).unwrap();
+            
+            prop_assert_eq!(&payload, &pt);
+        }
+
+        #[test]
+        fn prop_secretbox_roundtrip(payload in prop::collection::vec(any::<u8>(), 1..=4096)) {
+            sodiumoxide::init().unwrap();
+            
+            let key = secretbox::gen_key();
+            let (nonce, ct) = secretbox_encrypt(&key, &payload);
+            let pt = secretbox_decrypt(&key, &nonce, &ct).unwrap();
+            
+            prop_assert_eq!(&payload, &pt);
+        }
     }
 }
