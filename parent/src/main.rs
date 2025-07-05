@@ -5,15 +5,24 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use crypto_utils::{seal_to_pk, secretbox_decrypt};
 use hdrhistogram::Histogram;
+use hyper::service::service_fn;
+use hyper::{Body, Request, Response, StatusCode};
 use rand::RngCore;
+use rcgen::{Certificate, CertificateParams, DistinguishedName};
+use rustls::{Certificate as RustlsCertificate, PrivateKey, ServerConfig};
 use serde::{Deserialize, Serialize};
 use sodiumoxide::crypto::box_::{gen_keypair, PublicKey};
 use sodiumoxide::crypto::secretbox::Nonce;
+use std::convert::Infallible;
+use std::io::BufReader;
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tokio::net::TcpListener;
 use tokio::signal;
 use tokio::time::{interval, MissedTickBehavior};
+use tokio_rustls::TlsAcceptor;
 use tokio_vsock::{VsockAddr, VsockStream};
 
 #[derive(Parser, Debug)]
@@ -38,6 +47,10 @@ struct Args {
     /// Enclave vsock port
     #[arg(long, default_value = "5005")]
     port: u32,
+
+    /// Run mock Braze TLS server on port 8443
+    #[arg(long)]
+    mock_braze: bool,
 }
 
 /// Request message for subscribe mode
@@ -96,6 +109,97 @@ async fn send_subscribe_request(
     Ok(start.elapsed())
 }
 
+/// Generates a self-signed certificate for the mock Braze server
+fn generate_self_signed_cert() -> Result<(Vec<u8>, Vec<u8>)> {
+    let mut params = CertificateParams::new(vec!["localhost".to_string(), "127.0.0.1".to_string()]);
+    params.distinguished_name = DistinguishedName::new();
+
+    let cert = Certificate::from_params(params).context("Failed to generate certificate")?;
+
+    let cert_pem = cert
+        .serialize_pem()
+        .context("Failed to serialize certificate")?;
+    let key_pem = cert.serialize_private_key_pem();
+
+    Ok((cert_pem.into_bytes(), key_pem.into_bytes()))
+}
+
+/// Mock Braze handler that always returns 200 OK
+async fn mock_braze_handler(_req: Request<Body>) -> Result<Response<Body>, Infallible> {
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .body(Body::from("OK"))
+        .unwrap())
+}
+
+/// Starts the mock Braze TLS server on port 8443
+async fn start_mock_braze_server() -> Result<()> {
+    // Generate self-signed certificate
+    let (cert_pem, key_pem) =
+        generate_self_signed_cert().context("Failed to generate self-signed certificate")?;
+
+    // Parse certificate and key
+    let certs = rustls_pemfile::certs(&mut BufReader::new(&cert_pem[..]))
+        .map_err(|_| anyhow::anyhow!("Failed to parse certificate"))?
+        .into_iter()
+        .map(RustlsCertificate)
+        .collect::<Vec<_>>();
+
+    let mut keys = rustls_pemfile::pkcs8_private_keys(&mut BufReader::new(&key_pem[..]))
+        .map_err(|_| anyhow::anyhow!("Failed to parse private key"))?;
+
+    if keys.is_empty() {
+        anyhow::bail!("No private keys found");
+    }
+
+    let key = PrivateKey(keys.remove(0));
+
+    // Configure TLS
+    let tls_cfg = ServerConfig::builder()
+        .with_safe_defaults()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .context("Failed to create TLS config")?;
+
+    let tls_acceptor = TlsAcceptor::from(Arc::new(tls_cfg));
+
+    // Bind TCP listener
+    let addr = SocketAddr::from(([0, 0, 0, 0], 8443));
+    let tcp_listener = TcpListener::bind(addr)
+        .await
+        .context("Failed to bind TCP listener on port 8443")?;
+
+    println!("Mock Braze TLS server listening on https://0.0.0.0:8443");
+
+    loop {
+        let (tcp_stream, _remote_addr) = tcp_listener
+            .accept()
+            .await
+            .context("Failed to accept TCP connection")?;
+
+        let tls_acceptor = tls_acceptor.clone();
+
+        tokio::spawn(async move {
+            // Accept TLS connection
+            let tls_stream = match tls_acceptor.accept(tcp_stream).await {
+                Ok(stream) => stream,
+                Err(e) => {
+                    eprintln!("TLS accept error: {}", e);
+                    return;
+                }
+            };
+
+            // Use hyper to handle HTTP over TLS
+            if let Err(e) = hyper::server::conn::Http::new()
+                .serve_connection(tls_stream, service_fn(mock_braze_handler))
+                .await
+            {
+                eprintln!("HTTP connection error: {}", e);
+            }
+        });
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize sodiumoxide
@@ -112,6 +216,19 @@ async fn main() -> Result<()> {
     println!("  Target: vsock://{}:{}", args.cid, args.port);
     println!("  RPS: {}", args.rps);
     println!("  Duration: {} seconds", args.seconds);
+    println!("  Mock Braze: {}", args.mock_braze);
+
+    // Start mock Braze server if requested
+    if args.mock_braze {
+        tokio::spawn(async {
+            if let Err(e) = start_mock_braze_server().await {
+                eprintln!("Mock Braze server error: {:?}", e);
+            }
+        });
+
+        // Give the server time to start
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
 
     // Generate client keypair
     let (client_pk, _client_sk) = gen_keypair();
