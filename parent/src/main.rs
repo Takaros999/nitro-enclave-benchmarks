@@ -3,7 +3,7 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use crypto_utils::{seal_to_pk, secretbox_decrypt};
+use crypto_utils::{seal_to_pk, secretbox_decrypt, secretbox_encrypt};
 use hdrhistogram::Histogram;
 use hyper::service::service_fn;
 use hyper::{Body, Request, Response, StatusCode};
@@ -12,13 +12,14 @@ use rcgen::{Certificate, CertificateParams, DistinguishedName};
 use rustls::{Certificate as RustlsCertificate, PrivateKey, ServerConfig};
 use serde::{Deserialize, Serialize};
 use sodiumoxide::crypto::box_::{gen_keypair, PublicKey};
-use sodiumoxide::crypto::secretbox::Nonce;
+use sodiumoxide::crypto::secretbox::{gen_key, Key, Nonce};
 use std::convert::Infallible;
 use std::io::BufReader;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tokio::io::AsyncReadExt;
 use tokio::net::TcpListener;
 use tokio::signal;
 use tokio::time::{interval, MissedTickBehavior};
@@ -66,6 +67,20 @@ struct SubscribeResponse {
     ciphertext: Vec<u8>,
 }
 
+/// Request message for notify mode
+#[derive(Serialize, Deserialize, Debug)]
+struct NotifyRequest {
+    nonce: [u8; 24],
+    ciphertext: Vec<u8>,
+}
+
+/// Response message for notify mode (not used in current protocol)
+#[derive(Serialize, Deserialize, Debug)]
+struct NotifyResponse {
+    nonce: [u8; 24],
+    ciphertext: Vec<u8>,
+}
+
 /// Sends a single subscribe request and measures latency
 async fn send_subscribe_request(
     addr: VsockAddr,
@@ -104,6 +119,50 @@ async fn send_subscribe_request(
             // This is expected since we don't have the real symmetric key
             // In production, we'd derive this from the handshake
         }
+    }
+
+    Ok(start.elapsed())
+}
+
+/// Sends a single notify request and measures latency
+async fn send_notify_request(
+    addr: VsockAddr,
+    symmetric_key: &Key,
+    payload_size: usize,
+) -> Result<Duration> {
+    let start = Instant::now();
+
+    // Connect to enclave
+    let mut stream = VsockStream::connect(addr)
+        .await
+        .context("Failed to connect to enclave")?;
+
+    // Generate random braze_id as payload
+    let mut payload = vec![0u8; payload_size];
+    rand::thread_rng().fill_bytes(&mut payload);
+
+    // Encrypt with symmetric key
+    let (nonce, ciphertext) = secretbox_encrypt(symmetric_key, &payload);
+
+    // Create and send request
+    let request = NotifyRequest {
+        nonce: nonce.0,
+        ciphertext,
+    };
+    bincode::serialize_into(&mut stream, &request).context("Failed to serialize request")?;
+
+    // Read response (1 byte: 0x01 for success, 0x00 for failure)
+    let mut response_byte = [0u8; 1];
+    stream
+        .read_exact(&mut response_byte)
+        .await
+        .context("Failed to read response")?;
+
+    if response_byte[0] != 0x01 {
+        anyhow::bail!(
+            "Notify request failed with response: {:#x}",
+            response_byte[0]
+        );
     }
 
     Ok(start.elapsed())
@@ -207,13 +266,24 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
 
-    if args.mode != "subscribe" {
-        anyhow::bail!("Only subscribe mode is implemented in this milestone");
+    // Validate mode
+    if args.mode != "subscribe" && args.mode != "notify" {
+        anyhow::bail!(
+            "Invalid mode: {}. Must be 'subscribe' or 'notify'",
+            args.mode
+        );
     }
+
+    // Set port based on mode (override CLI arg if needed)
+    let port = match args.mode.as_str() {
+        "subscribe" => 5005,
+        "notify" => 5006,
+        _ => unreachable!(),
+    };
 
     println!("Starting parent process:");
     println!("  Mode: {}", args.mode);
-    println!("  Target: vsock://{}:{}", args.cid, args.port);
+    println!("  Target: vsock://{}:{}", args.cid, port);
     println!("  RPS: {}", args.rps);
     println!("  Duration: {} seconds", args.seconds);
     println!("  Mock Braze: {}", args.mock_braze);
@@ -260,7 +330,7 @@ async fn main() -> Result<()> {
     let mut ticker = interval(interval_duration);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
-    let addr = VsockAddr::new(args.cid, args.port);
+    let addr = VsockAddr::new(args.cid, port);
     let test_duration = Duration::from_secs(args.seconds);
     let test_start = Instant::now();
 
@@ -274,24 +344,51 @@ async fn main() -> Result<()> {
         ticker.tick().await;
 
         let histogram_clone = histogram.clone();
-        let client_pk_clone = client_pk.clone();
-        let server_pk_clone = server_pk.clone();
 
         // Spawn task for each request to avoid blocking the ticker
-        tokio::spawn(async move {
-            match send_subscribe_request(addr, &client_pk_clone, &server_pk_clone, 1024).await {
-                Ok(latency) => {
-                    // Record latency in microseconds
-                    let latency_us = latency.as_micros() as u64;
-                    if let Ok(mut hist) = histogram_clone.lock() {
-                        hist.record(latency_us).ok();
+        match args.mode.as_str() {
+            "subscribe" => {
+                let client_pk_clone = client_pk.clone();
+                let server_pk_clone = server_pk.clone();
+
+                tokio::spawn(async move {
+                    match send_subscribe_request(addr, &client_pk_clone, &server_pk_clone, 1024)
+                        .await
+                    {
+                        Ok(latency) => {
+                            // Record latency in microseconds
+                            let latency_us = latency.as_micros() as u64;
+                            if let Ok(mut hist) = histogram_clone.lock() {
+                                hist.record(latency_us).ok();
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("Request failed: {}", e);
+                        }
                     }
-                }
-                Err(e) => {
-                    eprintln!("Request failed: {}", e);
-                }
+                });
             }
-        });
+            "notify" => {
+                // Generate new symmetric key for each request
+                let symmetric_key = gen_key();
+
+                tokio::spawn(async move {
+                    match send_notify_request(addr, &symmetric_key, 32).await {
+                        Ok(latency) => {
+                            // Record latency in microseconds
+                            let latency_us = latency.as_micros() as u64;
+                            if let Ok(mut hist) = histogram_clone.lock() {
+                                hist.record(latency_us).ok();
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("Request failed: {}", e);
+                        }
+                    }
+                });
+            }
+            _ => unreachable!(),
+        }
 
         total_requests += 1;
     }

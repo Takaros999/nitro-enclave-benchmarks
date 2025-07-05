@@ -11,7 +11,7 @@ use serde_json::json;
 use sodiumoxide::crypto::box_::{gen_keypair, SecretKey};
 use sodiumoxide::crypto::secretbox::{Key, Nonce};
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio_vsock::{VsockAddr, VsockListener, VsockStream};
 
 #[derive(Parser, Debug)]
@@ -60,7 +60,8 @@ struct SubscribeResponse {
 /// Request message for notify mode
 #[derive(Serialize, Deserialize, Debug)]
 struct NotifyRequest {
-    sealed_payload: Vec<u8>,
+    nonce: [u8; 24],
+    ciphertext: Vec<u8>,
 }
 
 /// Response message for notify mode
@@ -102,41 +103,20 @@ async fn handle_subscribe_connection(
 }
 
 /// Handles a single vsock connection for notify mode.
-/// Protocol: read len||nonce||cipher, decrypt braze_id, POST to TLS endpoint
+/// Protocol: uses bincode serialization for request message
 async fn handle_notify_connection(
     mut stream: VsockStream,
     _server_sk: Arc<SecretKey>,
     symmetric_key: Arc<Key>,
     https_client: Arc<Client<hyper_rustls::HttpsConnector<hyper::client::HttpConnector>>>,
 ) -> Result<()> {
-    // Read length prefix (4 bytes)
-    let mut len_buf = [0u8; 4];
-    stream
-        .read_exact(&mut len_buf)
-        .await
-        .context("Failed to read length prefix")?;
-    let payload_len = u32::from_le_bytes(len_buf) as usize;
+    // Read request using bincode
+    let request: NotifyRequest =
+        bincode::deserialize_from(&mut stream).context("Failed to deserialize notify request")?;
 
-    // Validate expected length (should be nonce + ciphertext)
-    if payload_len < 24 {
-        anyhow::bail!("Invalid payload length: {}", payload_len);
-    }
-
-    // Read nonce (24 bytes)
-    let mut nonce_buf = [0u8; 24];
-    stream
-        .read_exact(&mut nonce_buf)
-        .await
-        .context("Failed to read nonce")?;
-    let nonce = Nonce::from_slice(&nonce_buf).context("Invalid nonce")?;
-
-    // Read ciphertext (remaining bytes)
-    let cipher_len = payload_len - 24;
-    let mut ciphertext = vec![0u8; cipher_len];
-    stream
-        .read_exact(&mut ciphertext)
-        .await
-        .context("Failed to read ciphertext")?;
+    // Extract nonce and ciphertext
+    let nonce = Nonce::from_slice(&request.nonce).context("Invalid nonce")?;
+    let ciphertext = request.ciphertext;
 
     // Decrypt using symmetric key to get braze_id
     let braze_id_bytes = secretbox_decrypt(&symmetric_key, &nonce, &ciphertext)
