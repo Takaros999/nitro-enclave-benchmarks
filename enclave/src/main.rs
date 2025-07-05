@@ -12,6 +12,8 @@ use serde_json::json;
 use crypto_box::SecretKey;
 use chacha20poly1305::{Key, Nonce};
 use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use sysinfo::System;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_vsock::{VsockAddr, VsockListener, VsockStream};
 
@@ -21,6 +23,10 @@ struct Args {
     /// Operating mode: subscribe or notify
     #[arg(long, default_value = "subscribe")]
     mode: String,
+    
+    /// Enable resource monitoring
+    #[arg(long, default_value = "false")]
+    monitor: bool,
 }
 
 /// Operating mode for the enclave
@@ -43,6 +49,14 @@ impl std::str::FromStr for Mode {
             )),
         }
     }
+}
+
+/// Resource usage monitoring data
+#[derive(Serialize, Deserialize, Debug)]
+struct ResourceUsage {
+    timestamp: u64,
+    cpu_percent: f64,
+    memory_rss_kb: u64,
 }
 
 /// Request message for subscribe mode containing a sealed box payload
@@ -179,6 +193,49 @@ async fn handle_notify_connection(
     Ok(())
 }
 
+/// Read CPU and memory usage from /proc/self/ and send to parent
+async fn monitor_resources() -> Result<()> {
+    // parent is always CID 3 – you already use port 5008 there
+    let monitor_addr = VsockAddr::new(3, 5008);
+
+    let mut sys  = System::new();
+    let  pid     = sysinfo::get_current_pid().map_err(|e| anyhow::anyhow!("Failed to get PID: {}", e))?;         // our own PID
+
+    loop {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        // refresh *only* this process plus memory counters
+        sys.refresh_process(pid);
+        sys.refresh_memory();
+
+        // pull the numbers
+        let (cpu, rss) = match sys.process(pid) {
+            Some(p) => (p.cpu_usage() as f64, p.memory()),   // memory is already KiB
+            None    => (0.0, 0),
+        };
+
+        let usage = ResourceUsage {
+            timestamp: SystemTime::now()
+                .duration_since(UNIX_EPOCH)?
+                .as_secs(),
+            cpu_percent: cpu,           // 0-100 per vCPU, same semantics as `top`
+            memory_rss_kb: rss,
+        };
+        let payload = serde_json::to_vec(&usage)?;
+        let len     = payload.len() as u32;
+
+        // reconnect every sample – this keeps your parent code unchanged
+        if let Ok(mut stream) = VsockStream::connect(monitor_addr).await {
+            // length-prefix + JSON blob, exactly like before
+            if stream.write_all(&len.to_le_bytes()).await.is_ok()
+                && stream.write_all(&payload).await.is_ok()
+            {
+                // sent successfully
+            }
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // No initialization needed for pure Rust crypto
@@ -187,6 +244,14 @@ async fn main() -> Result<()> {
 
     // Parse mode
     let mode: Mode = args.mode.parse().context("Failed to parse mode")?;
+    
+    // Start monitoring task if enabled
+    println!("Starting resource monitoring...");
+    tokio::spawn(async {
+        if let Err(e) = monitor_resources().await {
+            eprintln!("Monitoring error: {:?}", e);
+        }
+    });
 
     // Load static keys from JSON file
     let (server_pk, server_sk, symmetric_key) = crypto_utils::load_static_keys()

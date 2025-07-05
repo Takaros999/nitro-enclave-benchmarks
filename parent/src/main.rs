@@ -81,6 +81,59 @@ struct NotifyResponse {
     ciphertext: Vec<u8>,
 }
 
+/// Resource usage monitoring data from enclave
+#[derive(Serialize, Deserialize, Debug)]
+struct ResourceUsage {
+    timestamp: u64,
+    cpu_percent: f64,
+    memory_rss_kb: u64,
+}
+
+/// Listen for monitoring data from enclave
+async fn start_monitoring_listener(monitoring_data: Arc<Mutex<Vec<ResourceUsage>>>) -> Result<()> {
+    use tokio_vsock::VsockListener;
+    
+    let addr = VsockAddr::new(tokio_vsock::VMADDR_CID_ANY, 5008);
+    let mut listener = VsockListener::bind(addr).context("Failed to bind monitoring listener")?;
+    
+    println!("Monitoring listener started on port 5008");
+    
+    loop {
+        match listener.accept().await {
+            Ok((mut stream, _)) => {
+                let monitoring_data = monitoring_data.clone();
+                tokio::spawn(async move {
+                    let mut buffer = [0u8; 4];
+                    loop {
+                        // Read length
+                        if stream.read_exact(&mut buffer).await.is_err() {
+                            break;
+                        }
+                        let len = u32::from_le_bytes(buffer) as usize;
+                        
+                        // Read data
+                        let mut data = vec![0u8; len];
+                        if stream.read_exact(&mut data).await.is_err() {
+                            break;
+                        }
+                        
+                        // Parse and store resource usage
+                        if let Ok(usage) = serde_json::from_slice::<ResourceUsage>(&data) {
+                            if let Ok(mut monitoring_data) = monitoring_data.lock() {
+                                monitoring_data.push(usage);
+                            }
+                        }
+                    }
+                });
+            }
+            Err(_) => {
+                // Continue listening
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    }
+}
+
 /// Sends a single subscribe request and measures latency
 async fn send_subscribe_request(
     addr: VsockAddr,
@@ -338,6 +391,17 @@ async fn main() -> Result<()> {
     let histogram = Arc::new(Mutex::new(
         Histogram::<u64>::new_with_bounds(1, 1_000_000, 3).context("Failed to create histogram")?,
     ));
+    
+    // Setup monitoring data collection
+    let monitoring_data = Arc::new(Mutex::new(Vec::<ResourceUsage>::new()));
+    let monitoring_data_clone = monitoring_data.clone();
+    
+    // Start monitoring listener
+    tokio::spawn(async move {
+        if let Err(e) = start_monitoring_listener(monitoring_data_clone).await {
+            eprintln!("Monitoring listener error: {:?}", e);
+        }
+    });
 
     // Setup shutdown flag
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -442,6 +506,42 @@ async fn main() -> Result<()> {
             println!("\nNo successful requests completed");
         }
     }
+    
+    // Display monitoring results if available
+    if let Ok(monitoring_data) = monitoring_data.lock() {
+        if !monitoring_data.is_empty() {
+            println!("\n=== Resource Usage ===");
+            
+            let cpu_values: Vec<f64> = monitoring_data.iter().map(|d| d.cpu_percent).collect();
+            let memory_values: Vec<u64> = monitoring_data.iter().map(|d| d.memory_rss_kb).collect();
+            
+            if !cpu_values.is_empty() {
+                let cpu_avg = cpu_values.iter().sum::<f64>() / cpu_values.len() as f64;
+                let cpu_max = cpu_values.iter().fold(0.0f64, |a, &b| a.max(b));
+                
+                println!("CPU Usage:");
+                print_ascii_histogram("CPU", cpu_avg, cpu_max, "%");
+            }
+            
+            if !memory_values.is_empty() {
+                let memory_avg = memory_values.iter().sum::<u64>() / memory_values.len() as u64;
+                let memory_max = *memory_values.iter().max().unwrap_or(&0);
+                
+                println!("Memory Usage (RSS):");
+                print_ascii_histogram("Memory", memory_avg as f64 / 1024.0, memory_max as f64 / 1024.0, "MB");
+            }
+        }
+    }
 
     Ok(())
+}
+
+/// Print a simple ASCII histogram for resource usage
+fn print_ascii_histogram(_name: &str, avg: f64, max: f64, unit: &str) {
+    let bars = 10;
+    let filled = if max > 0.0 { ((avg / max) * bars as f64) as usize } else { 0 };
+    let empty = bars - filled;
+    
+    let bar = "█".repeat(filled) + &"░".repeat(empty);
+    println!("[{}] {:.1}{} avg, {:.1}{} peak", bar, avg, unit, max, unit);
 }
