@@ -300,12 +300,14 @@ async fn main() -> Result<()> {
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
 
-    // Generate client keypair
-    let (client_pk, _client_sk) = gen_keypair();
+    // Load static keys from JSON file
+    let (server_pk, _server_sk, _symmetric_key) = crypto_utils::load_static_keys()
+        .expect("Failed to load static keys. Please run 'cargo run --bin gen_static_keys' from the crypto_utils directory first.");
 
-    // TODO: In real implementation, get server public key from enclave
-    // For now, using a dummy key
-    let (server_pk, _) = gen_keypair();
+    println!("Loaded static keys from keys/static_keys.json");
+
+    // Generate client keypair (not used in benchmark, but kept for compatibility)
+    let (client_pk, _client_sk) = gen_keypair();
 
     // Setup latency histogram (1us to 1s range)
     let histogram = Arc::new(Mutex::new(

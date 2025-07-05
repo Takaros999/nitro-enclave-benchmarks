@@ -8,7 +8,7 @@ use hyper::{Body, Client, Method, Request};
 use hyper_rustls::HttpsConnectorBuilder;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use sodiumoxide::crypto::box_::{gen_keypair, SecretKey};
+use sodiumoxide::crypto::box_::SecretKey;
 use sodiumoxide::crypto::secretbox::{Key, Nonce};
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
@@ -165,13 +165,14 @@ async fn main() -> Result<()> {
     // Parse mode
     let mode: Mode = args.mode.parse().context("Failed to parse mode")?;
 
-    // Generate server keypair once
-    let (server_pk, server_sk) = gen_keypair();
-    let server_sk = Arc::new(server_sk);
-    println!("Server public key: {:?}", server_pk.0);
+    // Load static keys from JSON file
+    let (server_pk, server_sk, symmetric_key) = crypto_utils::load_static_keys()
+        .expect("Failed to load static keys. Please run 'cargo run --bin gen_static_keys' from the crypto_utils directory first.");
 
-    // Generate symmetric key for secretbox
-    let symmetric_key = Arc::new(sodiumoxide::crypto::secretbox::gen_key());
+    let server_sk = Arc::new(server_sk);
+    let symmetric_key = Arc::new(symmetric_key);
+    println!("Loaded static keys from keys/static_keys.json");
+    println!("Server public key: {:?}", server_pk.0);
 
     // Create HTTPS client for notify mode
     let https_connector = HttpsConnectorBuilder::new()

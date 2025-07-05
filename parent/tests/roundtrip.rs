@@ -307,10 +307,7 @@ async fn test_large_payload() -> Result<()> {
 }
 
 /// Mock enclave that processes notify requests
-async fn mock_notify_enclave_handler(
-    mut stream: TcpStream,
-    symmetric_key: Arc<Key>,
-) -> Result<()> {
+async fn mock_notify_enclave_handler(mut stream: TcpStream, symmetric_key: Arc<Key>) -> Result<()> {
     // Read length prefix first
     let mut len_buf = [0u8; 8];
     stream
@@ -416,7 +413,10 @@ async fn send_test_notify_request(port: u16, symmetric_key: &Key, payload: &[u8]
         .context("Failed to read notify response")?;
 
     if response_byte[0] != 0x01 {
-        anyhow::bail!("Notify request failed with response: {:#x}", response_byte[0]);
+        anyhow::bail!(
+            "Notify request failed with response: {:#x}",
+            response_byte[0]
+        );
     }
 
     Ok(())

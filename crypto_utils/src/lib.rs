@@ -1,9 +1,63 @@
-#![deny(clippy::all, unsafe_code)]
+#![deny(clippy::all)]
+#![allow(unsafe_code)] // Required for sodiumoxide
 
-use anyhow::Result;
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 use sodiumoxide::crypto::box_::{PublicKey, SecretKey};
 use sodiumoxide::crypto::sealedbox;
 use sodiumoxide::crypto::secretbox::{self, Key, Nonce};
+use std::fs;
+use std::path::Path;
+
+/// Static keys structure to be serialized to JSON
+#[derive(Serialize, Deserialize, Debug)]
+pub struct StaticKeys {
+    /// Base64-encoded public key for sealed box operations
+    pub public_key: String,
+    /// Base64-encoded secret key for sealed box operations
+    pub secret_key: String,
+    /// Base64-encoded symmetric key for secret box operations
+    pub symmetric_key: String,
+}
+
+/// Load static keys from keys/static_keys.json file
+pub fn load_static_keys() -> Result<(PublicKey, SecretKey, Key)> {
+    let keys_path = Path::new("keys/static_keys.json");
+
+    // Read the JSON file
+    let json_content = fs::read_to_string(keys_path)
+        .with_context(|| format!(
+            "Failed to read static keys from {}. Please run 'cargo run --bin gen_static_keys' from the crypto_utils directory first.",
+            keys_path.display()
+        ))?;
+
+    // Parse JSON
+    let keys: StaticKeys =
+        serde_json::from_str(&json_content).context("Failed to parse static keys JSON")?;
+
+    // Decode base64 keys
+    use base64::Engine;
+    let engine = base64::engine::general_purpose::STANDARD;
+    let pk_bytes = engine
+        .decode(&keys.public_key)
+        .context("Failed to decode public key from base64")?;
+    let sk_bytes = engine
+        .decode(&keys.secret_key)
+        .context("Failed to decode secret key from base64")?;
+    let sym_bytes = engine
+        .decode(&keys.symmetric_key)
+        .context("Failed to decode symmetric key from base64")?;
+
+    // Convert to sodiumoxide types
+    let pk = PublicKey::from_slice(&pk_bytes)
+        .ok_or_else(|| anyhow::anyhow!("Invalid public key length"))?;
+    let sk = SecretKey::from_slice(&sk_bytes)
+        .ok_or_else(|| anyhow::anyhow!("Invalid secret key length"))?;
+    let sym_key = Key::from_slice(&sym_bytes)
+        .ok_or_else(|| anyhow::anyhow!("Invalid symmetric key length"))?;
+
+    Ok((pk, sk, sym_key))
+}
 
 /// Encrypts a message to a public key using libsodium sealed boxes.
 /// This provides anonymous sender encryption (X25519 + XChaCha20-Poly1305).
